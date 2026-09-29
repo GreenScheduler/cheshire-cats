@@ -1,0 +1,4 @@
+# This project does not use rustfmt: formatting is maintained by hand and
+# `cargo clippy` is the only style check. Turning formatting off makes
+# `cargo fmt` and editor format-on-save leave the code untouched.
+disable_all_formatting = true
