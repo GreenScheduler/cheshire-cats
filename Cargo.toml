@@ -1,0 +1,11 @@
+[package]
+name = "cheshire-cats"
+version = "0.1.0"
+edition = "2024"
+authors = [
+	"Anthony Greenberg <info@bayesicresearch.org>",
+	"Andrew Walker <andrew.walker@earth.ox.ac.uk>",
+]
+license = "MIT"
+
+[dependencies]
