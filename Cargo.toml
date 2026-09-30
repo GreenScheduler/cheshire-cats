@@ -19,3 +19,17 @@ jiff = "0.2"
 libc = "0.2"
 log = "0.4"
 signal-hook = "0.4"
+
+[dev-dependencies]
+libtest-mimic = "0.8.2"
+
+[features]
+# End-to-end tests against the Docker dev cluster (tests/cluster.rs). They run
+# inside the cheshire container; docker/cluster-test.sh starts the cluster, runs
+# them there, and tears it down.
+cluster-tests = []
+
+[[test]]
+name = "cluster"
+harness = false
+required-features = ["cluster-tests"]

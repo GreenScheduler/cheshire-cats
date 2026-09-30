@@ -1,0 +1,62 @@
+# Dev cluster for cheshire-cats: GreenScheduler's slurm-docker-cluster (the
+# git submodule next to this file, branch newer-slurm) plus a "cheshire"
+# container, playing the admin node the daemon runs on. It shares the cluster's
+# munge key and /etc/slurm and runs as root. slurmctld accepts this set up for node updates.
+#
+# The cluster tier of the tests starts and tears down all of this itself:
+#
+#   docker/cluster-test.sh
+#
+# For manual testing (the two volumes are created by cluster-test.sh,
+# or once with `docker volume create`):
+#
+#   docker compose -f docker/compose.yml build slurmdbd && docker compose -f docker/compose.yml up -d --build
+#   docker exec -it cheshire bash         # then: cargo build, cargo run -- ...
+#   docker compose -f docker/compose.yml down -v
+name: cheshire-cats-cluster
+
+include:
+  - slurm-docker-cluster/docker-compose.yml
+
+services:
+  cheshire:
+    build:
+      context: .
+      args:
+        # Built by the cluster's slurmdbd service; build that first.
+        BASE_IMAGE: slurm-docker-cluster:${IMAGE_TAG:-26.05.4}
+    image: cheshire-cats-dev:${IMAGE_TAG:-26.05.4}
+    container_name: cheshire
+    hostname: cheshire
+    volumes:
+      - etc_munge:/etc/munge
+      - etc_slurm:/etc/slurm
+      - slurm_jobdir:/data
+      - ..:/src
+      - cheshire_target:/target
+      - cheshire_cargo_registry:/usr/local/cargo/registry
+      # The host's zone, so local times on the command line mean the same as on
+      # the host. Not mounted over /etc/localtime: in the image that is a
+      # symlink to zoneinfo/UTC, so the mount would overwrite the UTC zone file
+      # while the jiff rust module we load still reads the zone name "UTC" from the symlink.
+      - /etc/localtime:/etc/host-localtime:ro
+    environment:
+      RUST_LOG: info
+      TZ: ":/etc/host-localtime"
+      # Tells tests/cluster.rs that this is the disposable dev cluster, where
+      # it may cancel jobs and drain and resume nodes. Never set it elsewhere.
+      CHESHIRE_DEV_CLUSTER: "1"
+    depends_on:
+      - slurmctld
+    networks:
+      - slurm-network
+
+volumes:
+  # Build output and downloaded crates, kept out of the host's target/. External,
+  # so `down -v` wipes the cluster's state but not these caches.
+  cheshire_target:
+    external: true
+    name: cheshire-cats-target
+  cheshire_cargo_registry:
+    external: true
+    name: cheshire-cats-cargo-registry

@@ -1,0 +1,4 @@
+[submodule "docker/slurm-docker-cluster"]
+	path = docker/slurm-docker-cluster
+	url = https://github.com/GreenScheduler/slurm-docker-cluster.git
+	branch = newer-slurm
