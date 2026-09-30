@@ -1,4 +1,4 @@
-//! Safe wrapper over the libslurm calls the daemon makes.
+//! Safe wrapper over the libslurm calls for our daemon.
 //!
 //! Everything here goes through the public, versioned libslurm API
 //! (`slurm_load_node`, `slurm_update_node`), which sends RPCs to slurmctld.
@@ -13,16 +13,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
-use slurm_sys as sys;
-
 use crate::gate::{Controller, Lease};
 use crate::node::{NodeState, NodeView};
 
 #[derive(Debug)]
 pub struct SlurmError {
-    op: &'static str,
+    op:  &'static str,
     code: i32,
-    msg: String,
+    msg:  String,
 }
 
 impl SlurmError {
@@ -30,8 +28,8 @@ impl SlurmError {
     /// immediately after the failing libslurm call.
     fn last(op: &'static str) -> Self {
         let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        let msg = unsafe { opt_string(sys::slurm_strerror(code)) }
-            .unwrap_or_else(|| "unknown error".into());
+        let msg  = unsafe { opt_string( slurm_sys::slurm_strerror(code) ) }
+            .unwrap_or_else( || "unknown error".into() );
         Self { op, code, msg }
     }
 
@@ -39,7 +37,8 @@ impl SlurmError {
         Self {
             op,
             code: libc::EINVAL,
-            msg: "argument contains a NUL byte".into(),
+            // NB: C string terminator (\0) is NUL not NULL
+            msg:  "argument contains a NUL byte".into(),
         }
     }
 
@@ -48,7 +47,7 @@ impl SlurmError {
         Self {
             op,
             code: 0,
-            msg: "simulated failure".into(),
+            msg:  "simulated failure".into(),
         }
     }
 }
@@ -66,7 +65,7 @@ unsafe fn opt_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        Some( unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() )
     }
 }
 
@@ -74,22 +73,22 @@ unsafe fn opt_string(p: *const c_char) -> Option<String> {
 /// Purely local; no RPC.
 pub fn expand_hostlist(expr: &str) -> Result<Vec<String>, SlurmError> {
     const OP: &str = "parse node list";
-    let c_expr = CString::new(expr).map_err(|_| SlurmError::nul_byte(OP))?;
-    let hl = unsafe { sys::slurm_hostlist_create(c_expr.as_ptr()) };
+    let c_expr     = CString::new(expr).map_err( |_| SlurmError::nul_byte(OP) )?;
+    let hl         = unsafe { slurm_sys::slurm_hostlist_create( c_expr.as_ptr() ) };
     if hl.is_null() {
-        return Err(SlurmError::last(OP));
+        return Err( SlurmError::last(OP) );
     }
     let mut names = Vec::new();
     loop {
-        let host = unsafe { sys::slurm_hostlist_shift(hl) };
+        let host = unsafe { slurm_sys::slurm_hostlist_shift(hl) };
         if host.is_null() {
             break;
         }
         // Allocated with plain malloc(), so released with free().
         names.extend(unsafe { opt_string(host) });
-        unsafe { libc::free(host.cast()) };
+        unsafe { libc::free( host.cast() ) };
     }
-    unsafe { sys::slurm_hostlist_destroy(hl) };
+    unsafe { slurm_sys::slurm_hostlist_destroy(hl) };
     Ok(names)
 }
 
@@ -107,10 +106,10 @@ impl Slurm {
     /// be read.
     pub fn init(conf: Option<&Path>) -> Result<Self, SlurmError> {
         let conf = conf
-            .map(|p| CString::new(p.as_os_str().as_bytes()))
+            .map( |p| CString::new( p.as_os_str().as_bytes() ) )
             .transpose()
-            .map_err(|_| SlurmError::nul_byte("read slurm.conf path"))?;
-        unsafe { sys::slurm_init(conf.as_ref().map_or(ptr::null(), |c| c.as_ptr())) };
+            .map_err( |_| SlurmError::nul_byte("read slurm.conf path") )?;
+        unsafe { slurm_sys::slurm_init( conf.as_ref().map_or( ptr::null(), |c| c.as_ptr() ) ) };
         Ok(Self {
             _not_send: PhantomData,
         })
@@ -118,21 +117,21 @@ impl Slurm {
 
     fn update(
         &mut self,
-        names: &[&str],
-        state: u32,
-        reason: Option<&str>,
+        names:        &[&str],
+        state:        u32,
+        reason:       Option<&str>,
         resume_after: Option<u32>,
     ) -> Result<(), SlurmError> {
         const OP: &str = "update nodes";
-        let node_names = CString::new(names.join(",")).map_err(|_| SlurmError::nul_byte(OP))?;
-        let reason = reason
+        let node_names = CString::new( names.join(",") ).map_err( |_| SlurmError::nul_byte(OP) )?;
+        let reason     = reason
             .map(CString::new)
             .transpose()
-            .map_err(|_| SlurmError::nul_byte(OP))?;
+            .map_err( |_| SlurmError::nul_byte(OP) )?;
 
-        let mut msg = MaybeUninit::<sys::update_node_msg_t>::zeroed();
+        let mut msg = MaybeUninit::<slurm_sys::update_node_msg_t>::zeroed();
         // Sets every field to its "not being changed" sentinel.
-        unsafe { sys::slurm_init_update_node_msg(msg.as_mut_ptr()) };
+        unsafe { slurm_sys::slurm_init_update_node_msg( msg.as_mut_ptr() ) };
         let mut msg = unsafe { msg.assume_init() };
         // libslurm only reads these strings; the casts drop a const it lacks.
         msg.node_names = node_names.as_ptr().cast_mut();
@@ -144,94 +143,95 @@ impl Slurm {
             msg.resume_after = secs;
         }
 
-        if unsafe { sys::slurm_update_node(&mut msg) } == sys::SLURM_SUCCESS as i32 {
-            Ok(())
+        if unsafe { slurm_sys::slurm_update_node(&mut msg) } == slurm_sys::SLURM_SUCCESS as i32 {
+            Ok( () )
         } else {
-            Err(SlurmError::last(OP))
+            Err( SlurmError::last(OP) )
         }
     }
 }
 
 impl Drop for Slurm {
     fn drop(&mut self) {
-        unsafe { sys::slurm_fini() };
+        unsafe { slurm_sys::slurm_fini() };
     }
 }
 
 /// Frees a `slurm_load_node` response when it goes out of scope.
-struct NodeInfoMsg(*mut sys::node_info_msg_t);
+struct NodeInfoMsg(*mut slurm_sys::node_info_msg_t);
 
 impl Drop for NodeInfoMsg {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe { sys::slurm_free_node_info_msg(self.0) };
+            unsafe { slurm_sys::slurm_free_node_info_msg(self.0) };
         }
     }
 }
 
 impl Controller for Slurm {
-    fn load(&mut self, names: &[String]) -> Result<Vec<NodeView>, SlurmError> {
+    fn load(&mut self, names: &[&str]) -> Result<Vec<NodeView>, SlurmError> {
         // The reply lists every node in the cluster; look ours up in O(1).
-        let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let wanted: HashSet<&str> = names.iter().copied().collect();
         let mut raw = ptr::null_mut();
         // update_time 0: always return the full table. SHOW_ALL includes
         // nodes in hidden partitions.
-        if unsafe { sys::slurm_load_node(0, &mut raw, sys::SHOW_ALL as u16) }
-            != sys::SLURM_SUCCESS as i32
+        if unsafe { slurm_sys::slurm_load_node(0, &mut raw, slurm_sys::SHOW_ALL as u16) }
+            != slurm_sys::SLURM_SUCCESS as i32
         {
             return Err(SlurmError::last("load nodes"));
         }
         let msg = NodeInfoMsg(raw);
         if msg.0.is_null() {
-            return Ok(Vec::new());
+            return Ok( Vec::new() );
         }
-        let (array, count) = unsafe { ((*msg.0).node_array, (*msg.0).record_count) };
-        if array.is_null() {
-            return Ok(Vec::new());
+        let (node_array, count) = unsafe { ( (*msg.0).node_array, (*msg.0).record_count ) };
+        if node_array.is_null() {
+            return Ok( Vec::new() );
         }
 
-        let mut views = Vec::with_capacity(names.len());
-        for n in unsafe { std::slice::from_raw_parts(array, count as usize) } {
-            let Some(name) = (unsafe { opt_string(n.name) }) else {
+        let mut node_views = Vec::with_capacity( names.len() );
+        for each_node in unsafe { std::slice::from_raw_parts(node_array, count as usize) } {
+            let Some(name) = (unsafe { opt_string(each_node.name) }) else {
                 continue;
             };
             if !wanted.contains(name.as_str()) {
                 continue;
             }
-            views.push(NodeView {
+            node_views.push(NodeView {
                 name,
-                state: NodeState(n.node_state),
-                reason: unsafe { opt_string(n.reason) },
-                resume_after: n.resume_after,
+                state:        NodeState(each_node.node_state),
+                reason:       unsafe { opt_string(each_node.reason) },
+                resume_after: each_node.resume_after,
             });
         }
-        Ok(views)
+        Ok(node_views)
     }
 
     /// `NODE_STATE_DRAIN`: no new jobs are scheduled, running jobs finish.
     ///
     /// On an already-drained node slurmctld treats this as an equivalent
     /// state change: only the timer (and the reason, if given) is updated,
-    /// which is what makes lease renewal cheap. `resume_after` is relative
-    /// seconds, and is honored only together with DRAIN or DOWN.
+    /// making lease renewal cheap. `resume_after` is relative
+    /// seconds, and is honored only if DRAIN or DOWN are also set.
     fn drain(
         &mut self,
-        names: &[&str],
+        names:  &[&str],
         reason: Option<&str>,
-        lease: Lease,
+        lease:  Lease,
     ) -> Result<(), SlurmError> {
         let resume_after = match lease {
             Lease::Seconds(s) => s,
-            Lease::Cancel => sys::INFINITE,
+            Lease::Cancel     => slurm_sys::INFINITE,
         };
-        self.update(names, sys::NODE_STATE_DRAIN, reason, Some(resume_after))
+        self.update( names, slurm_sys::NODE_STATE_DRAIN, reason, Some(resume_after) )
     }
 
-    /// `NODE_STATE_UNDRAIN` clears only the DRAIN flag: unlike `NODE_RESUME`
-    /// it leaves a node that went DOWN in the meantime DOWN. It also clears a
+    /// `NODE_STATE_UNDRAIN` clears only the DRAIN flag, leaving
+    /// a node that went DOWN in the meantime DOWN. It also clears a
     /// pending `resume_after`, canceling our lease.
+    /// NOTE: undraining does not power a node up; that needs `NODE_STATE_POWER_UP`.
     fn undrain(&mut self, names: &[&str]) -> Result<(), SlurmError> {
-        self.update(names, sys::NODE_STATE_UNDRAIN, None, None)
+        self.update(names, slurm_sys::NODE_STATE_UNDRAIN, None, None)
     }
 }
 

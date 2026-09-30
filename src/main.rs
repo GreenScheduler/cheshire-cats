@@ -17,7 +17,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use clap::Parser;
-use jiff::{SignedDuration, Timestamp, civil, tz::TimeZone};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
+use jiff::{SignedDuration, Timestamp, civil};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -34,7 +35,8 @@ struct Args {
     nodes: Vec<String>,
 
     /// When to start draining: "now", RFC 3339 with an offset, or local
-    /// time as "YYYY-MM-DD HH:MM[:SS]".
+    /// time as "YYYY-MM-DD HH:MM[:SS]". A local time that a daylight saving
+    /// time change skips or repeats needs an offset.
     #[arg(long, default_value = "now", value_parser = parse_time)]
     drain_at: Timestamp,
 
@@ -64,6 +66,16 @@ struct Args {
 }
 
 fn parse_time(time_string: &str) -> Result<Timestamp, String> {
+    parse_time_in( time_string, &TimeZone::system() )
+}
+
+/// Parses a time, reading one without an offset as local time in `tz`.
+///
+/// A local time that a daylight saving time change skips (spring forward) or
+/// repeats (fall back) is an error rather than a guess: the caller has to give
+/// an offset. Once parsed, a time is an absolute instant, so DST changes no
+/// longer affect waits, leases or the window length.
+fn parse_time_in(time_string: &str, tz: &TimeZone) -> Result<Timestamp, String> {
     if time_string == "now" {
         return Ok( Timestamp::now() );
     }
@@ -71,15 +83,37 @@ fn parse_time(time_string: &str) -> Result<Timestamp, String> {
         return Ok(ts);
     }
     let local: civil::DateTime = time_string.parse().map_err( |e| format!("{e}") )?;
-    local
-        .to_zoned( TimeZone::system() )
-        .map( |z| z.timestamp() )
-        .map_err( |e| e.to_string() )
+    let with_offset            = |offset: Offset| {
+        offset
+            .to_timestamp(local)
+            .map( |ts| ts.display_with_offset(offset).to_string() )
+            .unwrap_or_default()
+    };
+    match tz.to_ambiguous_timestamp(local).offset() {
+        AmbiguousOffset::Unambiguous { offset } => {
+            offset.to_timestamp(local).map_err( |e| e.to_string() )
+        }
+        AmbiguousOffset::Gap { .. } => Err( format!(
+            "{local} does not exist in the local time zone: clocks skip it \
+             for daylight saving time. Pick another time or give an offset"
+        ) ),
+        AmbiguousOffset::Fold { before, after } => Err( format!(
+            "{local} occurs twice in the local time zone: clocks repeat it \
+             for daylight saving time. Give an offset: {} (first) or {} (second)",
+            with_offset(before),
+            with_offset(after)
+        ) ),
+    }
 }
 
 fn local(time_stamp: Timestamp) -> impl std::fmt::Display {
+    local_in( time_stamp, TimeZone::system() )
+}
+
+/// The zone abbreviation tells apart the two passes through a repeated hour.
+fn local_in(time_stamp: Timestamp, tz: TimeZone) -> impl std::fmt::Display {
     time_stamp
-        .to_zoned( TimeZone::system() )
+        .to_zoned(tz)
         .strftime("%Y-%m-%d %H:%M %Z")
 }
 
@@ -240,5 +274,82 @@ mod tests {
             .timestamp();
         assert_eq!(parse_time("2026-09-29 18:00").unwrap(), expected);
         assert_eq!(parse_time("2026-09-29T18:00").unwrap(), expected);
+    }
+
+    // Daylight saving time. A fixed POSIX rule, not the tz database, so the
+    // tests don't depend on the machine's zone or installed zoneinfo.
+    // In 2026 New York springs forward on March 8 (02:00 EST -> 03:00 EDT)
+    // and falls back on November 1 (02:00 EDT -> 01:00 EST).
+
+    fn new_york() -> TimeZone {
+        TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap()
+    }
+
+    fn at(time_string: &str) -> Timestamp {
+        parse_time_in( time_string, &new_york() ).unwrap()
+    }
+
+    fn hours_between(from: &str, to: &str) -> i64 {
+        at(from).duration_until( at(to) ).as_secs() / 3600
+    }
+
+    #[test]
+    fn rejects_local_time_skipped_by_spring_forward() {
+        let err = parse_time_in( "2026-03-08 02:30", &new_york() ).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn rejects_local_time_repeated_by_fall_back_and_suggests_offsets() {
+        let err = parse_time_in( "2026-11-01 01:30", &new_york() ).unwrap_err();
+        assert!(err.contains("occurs twice"), "{err}");
+        assert!(err.contains("2026-11-01T01:30:00-04:00"), "{err}");
+        assert!(err.contains("2026-11-01T01:30:00-05:00"), "{err}");
+    }
+
+    #[test]
+    fn offset_picks_either_pass_through_a_repeated_hour() {
+        assert_eq!( at("2026-11-01T01:30:00-04:00"), at("2026-11-01T05:30:00Z") );
+        assert_eq!( at("2026-11-01T01:30:00-05:00"), at("2026-11-01T06:30:00Z") );
+    }
+
+    #[test]
+    fn accepts_local_times_at_the_edges_of_a_dst_change() {
+        assert_eq!( at("2026-03-08 01:59"), at("2026-03-08T06:59:00Z") );
+        assert_eq!( at("2026-03-08 03:00"), at("2026-03-08T07:00:00Z") );
+        assert_eq!( at("2026-11-01 00:59"), at("2026-11-01T04:59:00Z") );
+        assert_eq!( at("2026-11-01 02:00"), at("2026-11-01T07:00:00Z") );
+    }
+
+    /// Before the window: the wait until the drain starts is real elapsed
+    /// time, not the difference between wall-clock readings.
+    #[test]
+    fn wait_for_drain_start_across_dst_change_is_real_time() {
+        assert_eq!( hours_between("2026-03-07 12:00", "2026-03-08 12:00"), 23 );
+        assert_eq!( hours_between("2026-10-31 12:00", "2026-11-01 12:00"), 25 );
+    }
+
+    /// During the window: its length, and so the number of lease renewals,
+    /// is real elapsed time.
+    #[test]
+    fn window_across_dst_change_is_real_time() {
+        assert_eq!( hours_between("2026-03-07 22:00", "2026-03-08 04:00"), 5 );
+        assert_eq!( hours_between("2026-10-31 22:00", "2026-11-01 04:00"), 7 );
+    }
+
+    /// A lease is relative seconds (slurmctld stores now + lease as Unix
+    /// time), so an hour-long lease across the change is an hour, and the
+    /// local time we log names the right side of it.
+    #[test]
+    fn lease_across_dst_change_is_real_time() {
+        let hour = Duration::from_secs(3600);
+
+        let start = at("2026-03-08 01:30");
+        assert_eq!( local_in( start, new_york() ).to_string(), "2026-03-08 01:30 EST" );
+        assert_eq!( local_in( start + hour, new_york() ).to_string(), "2026-03-08 03:30 EDT" );
+
+        let start = at("2026-11-01T01:30:00-04:00");
+        assert_eq!( local_in( start, new_york() ).to_string(), "2026-11-01 01:30 EDT" );
+        assert_eq!( local_in( start + hour, new_york() ).to_string(), "2026-11-01 01:30 EST" );
     }
 }

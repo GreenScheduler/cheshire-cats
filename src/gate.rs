@@ -41,18 +41,19 @@ pub enum Lease {
 pub trait Controller {
     /// Current view of the named nodes. Names slurmctld does not know are
     /// absent from the result.
-    fn load(&mut self, names: &[String]) -> Result<Vec<NodeView>, SlurmError>;
+    fn load(&mut self, names: &[&str]) -> Result<Vec<NodeView>, SlurmError>;
     /// Drain, or re-drain an already-drained node. `reason: None` leaves the
     /// stored reason unchanged.
     fn drain(
         &mut self,
-        names: &[&str],
+        names:  &[&str],
         reason: Option<&str>,
-        lease: Lease,
+        lease:  Lease,
     ) -> Result<(), SlurmError>;
     fn undrain(&mut self, names: &[&str]) -> Result<(), SlurmError>;
 }
 
+/// Holds the state of our interaction with a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// Not drained yet: the window has not opened, or the drain request
@@ -61,7 +62,7 @@ pub enum Status {
     /// Drained by us. `lease_until` is the resume time slurmctld stored at
     /// our last renewal (0 if it did not arm one).
     Held { lease_until: i64, phase: Phase },
-    /// Left alone: out of service for someone else when the window opened,
+    /// Left alone: someone else was interacting with the node when the window opened,
     /// unknown to slurmctld, or the drain did not take.
     Skipped,
     /// Someone else acted on it while we held it.
@@ -79,9 +80,9 @@ pub enum GateError {
 impl std::fmt::Display for GateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Slurm(e) => e.fmt(f),
+            Self::Slurm(e)            => e.fmt(f),
             Self::UnknownNodes(names) => {
-                write!(f, "unknown to slurmctld: {}", names.join(","))
+                write!( f, "unknown to slurmctld: {}", names.join(",") )
             }
         }
     }
@@ -95,12 +96,24 @@ impl From<SlurmError> for GateError {
     }
 }
 
+/// A node in the gate and what we are doing with it.
+struct GatedNode {
+    name:   String,
+    status: Status,
+}
+
+/// The nodes we influence during one drain window.
+/// Currently, the influence is only `DRAIN`, undone with `UNDRAIN` when the
+/// window closes. Nodes someone else has already taken out of service are
+/// skipped, and nodes someone else acts on while we hold them are given up
+/// for the rest of the window (see the module docs for the ownership rules).
 pub struct Gate {
-    /// Unique node names, in input order.
-    names: Vec<String>,
-    /// `status[i]` belongs to `names[i]`.
-    status: Vec<Status>,
+    /// One entry per unique node, in input order.
+    nodes: Vec<GatedNode>,
+    /// Full reason stored on each node, starting with `REASON_PREFIX`.
     reason: String,
+    /// Seconds after our last renewal at which slurmctld resumes a node on
+    /// its own. Renewed on every tick.
     lease: u32,
 }
 
@@ -110,25 +123,29 @@ impl Gate {
     /// `lease` is in seconds and must outlast at least two ticks.
     pub fn new(names: impl IntoIterator<Item = String>, reason: &str, lease: u32) -> Self {
         let mut seen = HashSet::new();
-        let names: Vec<String> = names
+        let nodes    = names
             .into_iter()
-            .filter(|n| seen.insert(n.clone()))
+            .filter( |n| seen.insert( n.clone() ) )
+            .map( |name| GatedNode { name, status: Status::Waiting } )
             .collect();
-        let status = vec![Status::Waiting; names.len()];
         Self {
-            names,
-            status,
+            nodes,
             reason: format!("{REASON_PREFIX} {reason}"),
             lease,
         }
     }
 
     pub fn node_count(&self) -> usize {
-        self.names.len()
+        self.nodes.len()
+    }
+
+    /// Node names, in input order.
+    fn names(&self) -> Vec<&str> {
+        self.nodes.iter().map( |n| n.name.as_str() ).collect()
     }
 
     fn count(&self, pred: impl Fn(&Status) -> bool) -> usize {
-        self.status.iter().filter(|s| pred(s)).count()
+        self.nodes.iter().filter( |n| pred(&n.status) ).count()
     }
 
     pub fn waiting(&self) -> usize {
@@ -136,31 +153,33 @@ impl Gate {
     }
 
     pub fn held(&self) -> usize {
-        self.count(|s| matches!(s, Status::Held { .. }))
+        self.count( |s| matches!(s, Status::Held { .. }) )
     }
 
     /// Checks that slurmctld knows every node, before committing to a window.
     pub fn validate(&self, ctl: &mut impl Controller) -> Result<(), GateError> {
-        let found: HashSet<String> = ctl.load(&self.names)?.into_iter().map(|v| v.name).collect();
-        let missing: Vec<String> = self
-            .names
+        let found: HashSet<String> = ctl.load( &self.names() )?.into_iter().map(|v| v.name).collect();
+        let missing: Vec<String>   = self
+            .nodes
             .iter()
-            .filter(|n| !found.contains(*n))
-            .cloned()
+            .filter( |n| !found.contains(&n.name) )
+            .map( |n| n.name.clone() )
             .collect();
         if missing.is_empty() {
-            Ok(())
+            Ok( () )
         } else {
-            Err(GateError::UnknownNodes(missing))
+            Err( GateError::UnknownNodes(missing) )
         }
     }
 
     fn load_map(&self, ctl: &mut impl Controller) -> Result<HashMap<String, NodeView>, SlurmError> {
-        Ok(ctl
-            .load(&self.names)?
+        Ok(
+            ctl
+            .load( &self.names() )?
             .into_iter()
-            .map(|v| (v.name.clone(), v))
-            .collect())
+            .map( |v| (v.name.clone(), v) )
+            .collect()
+        )
     }
 
     /// One pass while the window is open: drain nodes still waiting, check
@@ -168,11 +187,12 @@ impl Gate {
     /// Three RPCs regardless of node count: poll, drain/renew, read back.
     pub fn tick(&mut self, ctl: &mut impl Controller) -> Result<(), SlurmError> {
         let now = self.load_map(ctl)?;
-        // Indices into `names`/`status`, so the drain list keeps input order.
+        // Indices into `nodes`, so the drain list keeps input order.
         let mut to_drain = Vec::new();
 
-        for (i, (name, status)) in self.names.iter().zip(&mut self.status).enumerate() {
-            let view = now.get(name);
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let (name, status) = (&node.name, &mut node.status);
+            let view           = now.get(name);
             match *status {
                 Status::Waiting => match view {
                     None => {
@@ -194,9 +214,9 @@ impl Gate {
                     }
                 },
                 Status::Held { lease_until, phase } => {
-                    if let Some(v) = view.filter(|v| v.is_ours()) {
+                    if let Some(v) = view.filter( |v| v.is_ours() ) {
                         if v.phase() != phase {
-                            info!("{name}: {}", describe_phase(v.phase()));
+                            info!( "{name}: {}", describe_phase( v.phase() ) );
                         }
                         *status = Status::Held {
                             lease_until,
@@ -213,13 +233,13 @@ impl Gate {
         }
 
         if to_drain.is_empty() {
-            return Ok(());
+            return Ok( () );
         }
-        let refs: Vec<&str> = to_drain.iter().map(|&i| self.names[i].as_str()).collect();
-        let drain_ok = match ctl.drain(&refs, Some(&self.reason), Lease::Seconds(self.lease)) {
-            Ok(()) => true,
-            Err(e) => {
-                error!("drain {}: {e}", refs.join(","));
+        let refs: Vec<&str> = to_drain.iter().map( |&i| self.nodes[i].name.as_str() ).collect();
+        let drain_ok        = match ctl.drain( &refs, Some(&self.reason), Lease::Seconds(self.lease) ) {
+            Ok( () ) => true,
+            Err(e)   => {
+                error!( "drain {}: {e}", refs.join(",") );
                 false
             }
         };
@@ -228,12 +248,13 @@ impl Gate {
         // pending resume on a node someone took over is still ours.
         let back = self.load_map(ctl)?;
         for &i in &to_drain {
-            let (name, status) = (&self.names[i], &mut self.status[i]);
-            match (back.get(name).filter(|v| v.is_ours()), *status) {
+            let node           = &mut self.nodes[i];
+            let (name, status) = (&node.name, &mut node.status);
+            match (back.get(name).filter( |v| v.is_ours() ), *status) {
                 (Some(v), Status::Waiting) => {
                     info!(
                         "{name}: drained, no new jobs will start; {}",
-                        describe_phase(v.phase())
+                        describe_phase( v.phase() )
                     );
                     if v.resume_after == 0 {
                         warn!("{name}: slurmctld did not arm the lease");
@@ -259,14 +280,15 @@ impl Gate {
                 _ => {}
             }
         }
-        Ok(())
+        Ok( () )
     }
 
     /// Closes the window: undrains every node we still hold.
     pub fn release(&mut self, ctl: &mut impl Controller) -> Result<(), SlurmError> {
-        let now = self.load_map(ctl)?;
+        let now            = self.load_map(ctl)?;
         let mut to_undrain = Vec::new();
-        for (i, (name, status)) in self.names.iter().zip(&mut self.status).enumerate() {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let (name, status) = (&node.name, &mut node.status);
             let Status::Held { lease_until, .. } = *status else {
                 continue;
             };
@@ -279,31 +301,32 @@ impl Gate {
             }
         }
         if to_undrain.is_empty() {
-            return Ok(());
+            return Ok( () );
         }
 
-        let refs: Vec<&str> = to_undrain.iter().map(|&i| self.names[i].as_str()).collect();
+        let refs: Vec<&str> = to_undrain.iter().map( |&i| self.nodes[i].name.as_str() ).collect();
         if let Err(e) = ctl.undrain(&refs) {
-            error!("undrain {}: {e}", refs.join(","));
+            error!( "undrain {}: {e}", refs.join(",") );
         }
         let back = self.load_map(ctl)?;
         for i in to_undrain {
-            let name = &self.names[i];
+            let node = &mut self.nodes[i];
+            let name = &node.name;
             if back.get(name).is_some_and(NodeView::is_ours) {
                 error!("{name}: still drained; the lease will release it");
             } else {
                 info!("{name}: released");
-                self.status[i] = Status::Released;
+                node.status = Status::Released;
             }
         }
-        Ok(())
+        Ok( () )
     }
 }
 
 fn describe_phase(phase: Phase) -> &'static str {
     match phase {
         Phase::Draining => "draining, waiting for running jobs to finish",
-        Phase::Drained => "drained, no jobs running",
+        Phase::Drained  => "drained, no jobs running",
     }
 }
 
@@ -330,8 +353,8 @@ fn step_aside(ctl: &mut impl Controller, name: &str, view: Option<&NodeView>, le
     );
     if v.resume_after != 0 && v.resume_after == lease_until {
         match ctl.drain(&[name], None, Lease::Cancel) {
-            Ok(()) => info!("{name}: canceled our pending resume"),
-            Err(e) => error!("{name}: could not cancel our pending resume: {e}"),
+            Ok( () ) => info!("{name}: canceled our pending resume"),
+            Err(e)   => error!("{name}: could not cancel our pending resume: {e}"),
         }
     }
 }
@@ -343,11 +366,11 @@ mod tests {
     use slurm_sys as sys;
     use std::collections::BTreeMap;
 
-    const IDLE: u32 = sys::NODE_STATE_IDLE;
+    const IDLE: u32      = sys::NODE_STATE_IDLE;
     const ALLOCATED: u32 = sys::NODE_STATE_ALLOCATED;
-    const DOWN: u32 = sys::NODE_STATE_DOWN;
-    const DRAIN: u32 = sys::NODE_STATE_DRAIN;
-    const LEASE: u32 = 90;
+    const DOWN: u32      = sys::NODE_STATE_DOWN;
+    const DRAIN: u32     = sys::NODE_STATE_DRAIN;
+    const LEASE: u32     = 90;
 
     struct FakeNode {
         state: u32,
@@ -393,7 +416,7 @@ mod tests {
         fn admin_drain(&mut self, name: &str, reason: &str, resume_after: Option<i64>) {
             let n = self.nodes.get_mut(name).unwrap();
             n.state |= DRAIN;
-            n.reason = Some(reason.into());
+            n.reason = Some( reason.into() );
             if let Some(t) = resume_after {
                 n.resume_after = t;
             }
@@ -409,18 +432,20 @@ mod tests {
     }
 
     impl Controller for Fake {
-        fn load(&mut self, names: &[String]) -> Result<Vec<NodeView>, SlurmError> {
-            Ok(self
+        fn load(&mut self, names: &[&str]) -> Result<Vec<NodeView>, SlurmError> {
+            Ok(
+                self
                 .nodes
                 .iter()
-                .filter(|(name, _)| names.contains(*name))
+                .filter( |(name, _)| names.contains( &name.as_str() ) )
                 .map(|(name, n)| NodeView {
                     name: name.clone(),
                     state: NodeState(n.state),
                     reason: n.reason.clone(),
                     resume_after: n.resume_after,
                 })
-                .collect())
+                .collect() 
+            )
         }
 
         fn drain(
@@ -429,26 +454,26 @@ mod tests {
             reason: Option<&str>,
             lease: Lease,
         ) -> Result<(), SlurmError> {
-            self.drain_calls.push((
-                names.iter().map(|s| s.to_string()).collect(),
+            self.drain_calls.push( (
+                names.iter().map( |s| s.to_string() ).collect(),
                 reason.map(Into::into),
                 lease,
-            ));
+            ) );
             if self.fail_drain {
-                return Err(SlurmError::for_test("update nodes"));
+                return Err( SlurmError::for_test("update nodes") );
             }
             for name in names {
                 let n = self.nodes.get_mut(*name).unwrap();
                 n.state |= DRAIN;
                 if let Some(r) = reason {
-                    n.reason = Some(r.into());
+                    n.reason = Some( r.into() );
                 }
                 n.resume_after = match lease {
                     Lease::Seconds(s) => self.now + s as i64,
                     Lease::Cancel => 0,
                 };
             }
-            Ok(())
+            Ok( () )
         }
 
         fn undrain(&mut self, names: &[&str]) -> Result<(), SlurmError> {
@@ -457,17 +482,16 @@ mod tests {
                 n.state &= !DRAIN;
                 n.resume_after = 0;
             }
-            Ok(())
+            Ok( () )
         }
     }
 
     fn gate(names: &[&str]) -> Gate {
-        Gate::new(names.iter().map(|s| s.to_string()), "test", LEASE)
+        Gate::new(names.iter().map( |s| s.to_string() ), "test", LEASE)
     }
 
     fn status(g: &Gate, name: &str) -> Status {
-        let i = g.names.iter().position(|n| n == name).unwrap();
-        g.status[i]
+        g.nodes.iter().find(|n| n.name == name).unwrap().status
     }
 
     fn held(lease_until: i64, phase: Phase) -> Status {
@@ -478,7 +502,7 @@ mod tests {
     fn keeps_input_order_and_drops_repeats() {
         let mut ctl = Fake::with(&[("n1", IDLE, None), ("n2", IDLE, None), ("n3", IDLE, None)]);
         let mut g = gate(&["n3", "n1", "n3", "n2", "n1"]);
-        assert_eq!(g.names, ["n3", "n1", "n2"]);
+        assert_eq!(g.names(), ["n3", "n1", "n2"]);
         assert_eq!(g.node_count(), 3);
 
         g.tick(&mut ctl).unwrap();
@@ -490,30 +514,30 @@ mod tests {
         let mut ctl = Fake::with(&[
             ("n1", IDLE, None),
             ("n2", ALLOCATED, None),
-            ("n3", IDLE | DRAIN, Some("admin: bad dimm")),
-            ("n4", DOWN, Some("Not responding")),
+            ( "n3", IDLE | DRAIN, Some("admin: bad dimm") ),
+            ( "n4", DOWN, Some("Not responding") ),
         ]);
         let mut g = gate(&["n1", "n2", "n3", "n4"]);
         g.tick(&mut ctl).unwrap();
 
-        assert_eq!(status(&g, "n1"), held(1090, Phase::Drained));
-        assert_eq!(status(&g, "n2"), held(1090, Phase::Draining));
+        assert_eq!( status(&g, "n1"), held(1090, Phase::Drained) );
+        assert_eq!( status(&g, "n2"), held( 1090, Phase::Draining ) );
         assert_eq!(status(&g, "n3"), Status::Skipped);
         assert_eq!(status(&g, "n4"), Status::Skipped);
         assert_eq!(
             ctl.node("n1").reason.as_deref(),
             Some("cheshire-cats: test")
         );
-        assert_eq!(ctl.node("n3").reason.as_deref(), Some("admin: bad dimm"));
+        assert_eq!( ctl.node("n3").reason.as_deref(), Some("admin: bad dimm") );
         assert_eq!(ctl.node("n4").state & DRAIN, 0);
     }
 
     #[test]
     fn adopts_a_drain_left_by_an_earlier_run() {
-        let mut ctl = Fake::with(&[("n1", IDLE | DRAIN, Some("cheshire-cats: old"))]);
+        let mut ctl = Fake::with(&[( "n1", IDLE | DRAIN, Some("cheshire-cats: old") )]);
         let mut g = gate(&["n1"]);
         g.tick(&mut ctl).unwrap();
-        assert_eq!(status(&g, "n1"), held(1090, Phase::Drained));
+        assert_eq!( status(&g, "n1"), held(1090, Phase::Drained) );
     }
 
     #[test]
@@ -521,12 +545,12 @@ mod tests {
         let mut ctl = Fake::with(&[("n1", ALLOCATED, None)]);
         let mut g = gate(&["n1"]);
         g.tick(&mut ctl).unwrap();
-        assert_eq!(status(&g, "n1"), held(1090, Phase::Draining));
+        assert_eq!( status(&g, "n1"), held(1090, Phase::Draining) );
 
         ctl.now = 1030;
         ctl.nodes.get_mut("n1").unwrap().state = IDLE | DRAIN;
         g.tick(&mut ctl).unwrap();
-        assert_eq!(status(&g, "n1"), held(1120, Phase::Drained));
+        assert_eq!( status(&g, "n1"), held(1120, Phase::Drained) );
     }
 
     #[test]
@@ -539,7 +563,7 @@ mod tests {
 
         ctl.fail_drain = false;
         g.tick(&mut ctl).unwrap();
-        assert_eq!(status(&g, "n1"), held(1090, Phase::Drained));
+        assert_eq!( status(&g, "n1"), held(1090, Phase::Drained) );
     }
 
     #[test]
@@ -573,7 +597,7 @@ mod tests {
         assert_eq!(status(&g, "n1"), Status::SteppedAside);
         let n = ctl.node("n1");
         assert_eq!(n.resume_after, 0);
-        assert_eq!(n.reason.as_deref(), Some("admin: fan"));
+        assert_eq!( n.reason.as_deref(), Some("admin: fan") );
         assert_ne!(n.state & DRAIN, 0);
     }
 
@@ -583,7 +607,7 @@ mod tests {
         let mut g = gate(&["n1"]);
         g.tick(&mut ctl).unwrap();
 
-        ctl.admin_drain("n1", "admin: fan", Some(5000));
+        ctl.admin_drain( "n1", "admin: fan", Some(5000) );
         g.tick(&mut ctl).unwrap();
         assert_eq!(status(&g, "n1"), Status::SteppedAside);
         assert_eq!(ctl.node("n1").resume_after, 5000);
@@ -595,7 +619,7 @@ mod tests {
         let mut g = gate(&["n1", "n2"]);
         g.tick(&mut ctl).unwrap();
 
-        ctl.admin_drain("n2", "admin: reboot", Some(5000));
+        ctl.admin_drain( "n2", "admin: reboot", Some(5000) );
         g.release(&mut ctl).unwrap();
 
         assert_eq!(status(&g, "n1"), Status::Released);
@@ -609,7 +633,7 @@ mod tests {
     fn validate_reports_unknown_nodes() {
         let mut ctl = Fake::with(&[("n1", IDLE, None)]);
         match gate(&["n9", "n1", "n8"]).validate(&mut ctl) {
-            Err(GateError::UnknownNodes(missing)) => assert_eq!(missing, ["n9", "n8"]),
+            Err( GateError::UnknownNodes(missing) ) => assert_eq!(missing, ["n9", "n8"]),
             other => panic!("expected UnknownNodes, got {other:?}"),
         }
     }
