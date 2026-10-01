@@ -34,7 +34,7 @@ fn main() {
         );
     }
 
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!( "cargo:rustc-link-search=native={}", lib_dir.display() );
     println!("cargo:rustc-link-lib=dylib=slurm");
     // Exposed to dependents as DEP_SLURM_LIB_DIR so the binary can set an rpath.
     println!("cargo:lib_dir={}", lib_dir.display());

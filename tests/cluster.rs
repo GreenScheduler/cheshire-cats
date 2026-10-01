@@ -145,14 +145,16 @@ fn a_normal_window() -> Result<(), Failed> {
     Ok( () )
 }
 
-/// A node an admin drained before the window is skipped and left alone;
-/// SIGTERM releases the rest early.
+/// A node an admin drained before the window is skipped and left alone, and
+/// so is a node slurmctld does not know; SIGTERM releases the rest early.
 fn b_foreign_drain_and_sigterm() -> Result<(), Failed> {
     let _clean = Clean::new()?;
     admin(&["nodename=c1", "state=drain", "reason=admin: maintenance"]);
 
-    let mut daemon = Daemon::start("B", 120)?;
+    let mut daemon = Daemon::start_on("B", 120, "c[1-2],c9")?;
     pause(6);
+    daemon.has("c9: unknown to slurmctld; skipping")?;
+    daemon.has("2 of 3 nodes known to slurmctld")?;
     daemon.has("c1: already out of service")?;
     is( "c1 keeps admin reason", reason("c1"), "admin: maintenance" )?;
     starts( "c2 drained by us", reason("c2"), "cheshire-cats:" )?;
@@ -230,12 +232,17 @@ impl Daemon {
     /// Starts a window that opens now and closes `release_in` seconds from
     /// now, over both nodes, with a 5 s interval.
     fn start(name: &str, release_in: u64) -> Result<Self, Failed> {
+        Self::start_on(name, release_in, NODES)
+    }
+
+    /// Same as `start`, over the hostlist `nodes`.
+    fn start_on(name: &str, release_in: u64, nodes: &str) -> Result<Self, Failed> {
         let dir = std::env::temp_dir().join("cheshire-cluster-tests");
         fs::create_dir_all(&dir).map_err( |e| format!( "create {}: {e}", dir.display() ) )?;
         let log        = dir.join( format!("{name}.log") );
         let release_at = Timestamp::now() + Duration::from_secs(release_in);
         let child      = Command::new(BIN)
-            .args(["--release-at", &release_at.to_string(), "-i", "5", NODES])
+            .args(["--release-at", &release_at.to_string(), "-i", "5", nodes])
             .env("RUST_LOG", "info")
             .stdout( Stdio::null() )
             .stderr(File::create(&log).map_err( |e| format!( "create {}: {e}", log.display() ) )?)

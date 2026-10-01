@@ -74,15 +74,16 @@ pub enum Status {
 #[derive(Debug)]
 pub enum GateError {
     Slurm(SlurmError),
-    UnknownNodes(Vec<String>),
+    /// slurmctld knows none of the given nodes (comma-separated).
+    NoKnownNodes(String),
 }
 
 impl std::fmt::Display for GateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Slurm(e)            => e.fmt(f),
-            Self::UnknownNodes(names) => {
-                write!( f, "unknown to slurmctld: {}", names.join(",") )
+            Self::NoKnownNodes(names) => {
+                write!(f, "none of the nodes are known to slurmctld: {names}")
             }
         }
     }
@@ -156,19 +157,21 @@ impl Gate {
         self.count( |s| matches!(s, Status::Held { .. }) )
     }
 
-    /// Checks that slurmctld knows every node, before committing to a window.
-    pub fn validate(&self, ctl: &mut impl Controller) -> Result<(), GateError> {
+    /// Checks the nodes against slurmctld before committing to a window. Nodes
+    /// it does not know are skipped with a warning; it is an error only if it
+    /// knows none of them.
+    pub fn validate(&mut self, ctl: &mut impl Controller) -> Result<(), GateError> {
         let found: HashSet<String> = ctl.load( &self.names() )?.into_iter().map(|v| v.name).collect();
-        let missing: Vec<String>   = self
-            .nodes
-            .iter()
-            .filter( |n| !found.contains(&n.name) )
-            .map( |n| n.name.clone() )
-            .collect();
-        if missing.is_empty() {
-            Ok( () )
+        for node in &mut self.nodes {
+            if !found.contains(&node.name) {
+                warn!("{}: unknown to slurmctld; skipping", node.name);
+                node.status = Status::Skipped;
+            }
+        }
+        if self.waiting() == 0 {
+            Err( GateError::NoKnownNodes( self.names().join(",") ) )
         } else {
-            Err( GateError::UnknownNodes(missing) )
+            Ok( () )
         }
     }
 
@@ -196,7 +199,7 @@ impl Gate {
             match *status {
                 Status::Waiting => match view {
                     None => {
-                        warn!("{name}: unknown to slurmctld; skipping");
+                        warn!("{name}: no longer known to slurmctld; skipping");
                         *status = Status::Skipped;
                     }
                     Some(v) if v.is_foreign() => {
@@ -363,13 +366,12 @@ fn step_aside(ctl: &mut impl Controller, name: &str, view: Option<&NodeView>, le
 mod tests {
     use super::*;
     use crate::node::NodeState;
-    use slurm_sys as sys;
     use std::collections::BTreeMap;
 
-    const IDLE: u32      = sys::NODE_STATE_IDLE;
-    const ALLOCATED: u32 = sys::NODE_STATE_ALLOCATED;
-    const DOWN: u32      = sys::NODE_STATE_DOWN;
-    const DRAIN: u32     = sys::NODE_STATE_DRAIN;
+    const IDLE: u32      = slurm_sys::NODE_STATE_IDLE;
+    const ALLOCATED: u32 = slurm_sys::NODE_STATE_ALLOCATED;
+    const DOWN: u32      = slurm_sys::NODE_STATE_DOWN;
+    const DRAIN: u32     = slurm_sys::NODE_STATE_DRAIN;
     const LEASE: u32     = 90;
 
     struct FakeNode {
@@ -630,11 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_reports_unknown_nodes() {
+    fn validate_skips_unknown_nodes_and_keeps_the_rest() {
         let mut ctl = Fake::with(&[("n1", IDLE, None)]);
-        match gate(&["n9", "n1", "n8"]).validate(&mut ctl) {
-            Err( GateError::UnknownNodes(missing) ) => assert_eq!(missing, ["n9", "n8"]),
-            other => panic!("expected UnknownNodes, got {other:?}"),
+        let mut g   = gate(&["n9", "n1", "n8"]);
+        g.validate(&mut ctl).unwrap();
+        assert_eq!(status(&g, "n9"), Status::Skipped);
+        assert_eq!(status(&g, "n8"), Status::Skipped);
+        assert_eq!(status(&g, "n1"), Status::Waiting);
+
+        g.tick(&mut ctl).unwrap();
+        assert_eq!(ctl.drain_calls[0].0, ["n1"]);
+        assert_eq!( status(&g, "n1"), held(1090, Phase::Drained) );
+    }
+
+    #[test]
+    fn validate_fails_when_no_node_is_known() {
+        let mut ctl = Fake::with(&[("n1", IDLE, None)]);
+        match gate(&["n9", "n8"]).validate(&mut ctl) {
+            Err( GateError::NoKnownNodes(names) ) => assert_eq!(names, "n9,n8"),
+            other => panic!("expected NoKnownNodes, got {other:?}"),
         }
     }
 }
