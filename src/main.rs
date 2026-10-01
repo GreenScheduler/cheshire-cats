@@ -186,7 +186,8 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
 
     let interval = Duration::from_secs( args.interval.into() );
     info!(
-        "{} nodes; drain at {}, release at {}; lease {lease} s, renewed every {} s",
+        "{} of {} nodes known to slurmctld; drain at {}, release at {}; lease {lease} s, renewed every {} s",
+        gate.waiting(),
         gate.node_count(),
         local(args.drain_at),
         local(args.release_at),
