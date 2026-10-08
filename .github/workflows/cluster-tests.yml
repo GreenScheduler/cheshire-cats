@@ -1,0 +1,121 @@
+# Cluster tier: docker/cluster-test.sh builds the Docker dev cluster (Slurm from
+# source, plus the cheshire admin container), runs tests/cluster.rs inside
+# cheshire and exits with the result. The runner VM is thrown away afterward,
+# so the cluster is kept up (KEEP_CLUSTER=1) to collect its logs on failure.
+#
+# Building the images takes most of the time, so they are cached: saved after a
+# build, then loaded and used without a build (SKIP_BUILD=1) on later runs. The
+# key changes with the submodule commit (Slurm tag, cluster Dockerfile and
+# config), with the files of the cheshire image and compose.yml, and each
+# month, so OS packages and the Rust toolchain are refreshed.
+name: cluster-tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - 'src/**'
+    - 'slurm-sys/**'
+    - 'tests/**'
+    - 'build.rs'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'docker/**'
+    - '.github/workflows/cluster-tests.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+    - 'src/**'
+    - 'slurm-sys/**'
+    - 'tests/**'
+    - 'build.rs'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'docker/**'
+    - '.github/workflows/cluster-tests.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+        submodules: true
+
+    - name: Compute image cache key
+      id: images
+      env:
+        FILES_HASH: ${{ hashFiles('docker/Dockerfile', 'docker/cheshire-entrypoint.sh', 'docker/compose.yml') }}
+      run: |
+        submodule=$(git rev-parse HEAD:docker/slurm-docker-cluster)
+        echo "key=cluster-images-$(date -u +%Y-%m)-${submodule}-${FILES_HASH}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore images
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/cluster-images.tar.zst
+        key: ${{ steps.images.outputs.key }}
+
+    - name: Load images
+      if: steps.restore.outputs.cache-hit == 'true'
+      run: |
+        zstd -dc ~/cluster-images.tar.zst | docker load
+        rm ~/cluster-images.tar.zst
+
+    - name: Run the cluster tier
+      env:
+        KEEP_CLUSTER: "1"
+        SKIP_BUILD: ${{ steps.restore.outputs.cache-hit == 'true' && '1' || '0' }}
+      run: docker/cluster-test.sh
+
+    - name: Collect logs
+      if: failure()
+      run: |
+        mkdir -p logs
+        docker cp cheshire:/tmp/cheshire-cluster-tests logs/daemon || true
+        docker cp slurmctld:/var/log/slurm logs/slurm || true
+        docker compose -f docker/compose.yml logs --no-color > logs/compose.log 2>&1 || true
+
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: cluster-logs
+        path: logs/
+        if-no-files-found: ignore
+
+    # After a build, also when a test failed: the images are fine either way.
+    # Not when the runner stopped before all images were there.
+    - name: Export images
+      id: export
+      if: ${{ !cancelled() && steps.restore.outputs.cache-hit != 'true' }}
+      run: |
+        mapfile -t images < <(docker compose -f docker/compose.yml config --images | sort -u)
+        for image in "${images[@]}"; do
+          if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "image $image is missing; not caching"
+            exit 0
+          fi
+        done
+        docker save "${images[@]}" | zstd -T0 -q -o ~/cluster-images.tar.zst
+        ls -lh ~/cluster-images.tar.zst
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+
+    - name: Save images
+      if: ${{ !cancelled() && steps.export.outputs.ready == 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/cluster-images.tar.zst
+        key: ${{ steps.images.outputs.key }}
