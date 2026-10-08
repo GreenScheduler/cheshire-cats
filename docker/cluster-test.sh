@@ -8,6 +8,9 @@
 #
 # KEEP_CLUSTER=1 leaves the cluster running afterward, for debugging; tear it
 # down with `docker compose -f docker/compose.yml down -v`.
+#
+# SKIP_BUILD=1 uses the images already present instead of building them, and
+# fails if any is missing. CI sets it after loading the images from its cache.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -48,6 +51,15 @@ if docker ps -a --format '{{.Names}}' | grep -qx -E 'slurmctld|slurmdbd|mysql|c1
 	die "cluster containers already exist (see docker ps -a); remove them first, e.g. with: docker compose -f docker/compose.yml down -v"
 fi
 
+# Without a build, every image the cluster uses must be here already, the pulled
+# ones (mariadb) included.
+if [ "${SKIP_BUILD:-0}" = 1 ]; then
+	for image in $("${compose[@]}" config --images | sort -u); do
+		docker image inspect "$image" >/dev/null 2>&1 ||
+			die "SKIP_BUILD=1, but image $image is missing"
+	done
+fi
+
 # Tears the cluster down, containers and state, unless KEEP_CLUSTER=1.
 teardown() {
 	if [ "${KEEP_CLUSTER:-0}" = 1 ]; then
@@ -64,10 +76,14 @@ trap 'exit 130' INT TERM
 docker volume create cheshire-cats-target >/dev/null
 docker volume create cheshire-cats-cargo-registry >/dev/null
 
-echo "cluster-test: building images"
-# cheshire's image is built FROM the cluster image, so build that first.
-"${compose[@]}" build --quiet slurmdbd
-"${compose[@]}" build --quiet cheshire
+if [ "${SKIP_BUILD:-0}" = 1 ]; then
+	echo "cluster-test: SKIP_BUILD=1, using the existing images"
+else
+	echo "cluster-test: building images"
+	# cheshire's image is built FROM the cluster image, so build that first.
+	"${compose[@]}" build --quiet slurmdbd
+	"${compose[@]}" build --quiet cheshire
+fi
 
 echo "cluster-test: starting the cluster"
 "${compose[@]}" up -d --quiet-pull

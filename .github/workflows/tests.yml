@@ -1,0 +1,91 @@
+# Unit tier: cargo test and clippy against a libslurm built from source. No
+# cluster needed. Ubuntu's own libslurm-dev is too old (we need >= 25.05), so
+# the job builds the API library and headers of the release the dev cluster
+# runs, and caches the install.
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - '**.rs'
+    - '**/Cargo.toml'
+    - 'Cargo.lock'
+    - 'slurm-sys/wrapper.h'
+    - '.github/workflows/tests.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+    - '**.rs'
+    - '**/Cargo.toml'
+    - 'Cargo.lock'
+    - 'slurm-sys/wrapper.h'
+    - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Keep in step with SLURM_TAG in docker/slurm-docker-cluster/.env, so the
+  # unit tier builds against the same release as the cluster tier.
+  SLURM_TAG: slurm-26-05-4-1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    # The runner's OS release (e.g. ubuntu24.04) goes in the cache key: a
+    # libslurm built on one release may need a newer glibc than another has.
+    - name: Locate libslurm
+      id: slurm-key
+      run: |
+        echo "SLURM_PREFIX=$HOME/slurm-prefix" >> "$GITHUB_ENV"
+        echo "key=libslurm-${SLURM_TAG}-$(. /etc/os-release && echo "$ID$VERSION_ID")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore libslurm
+      id: slurm-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/slurm-prefix
+        key: ${{ steps.slurm-key.outputs.key }}
+
+    # Only the API library and the installed headers, including the generated
+    # slurm_version.h.
+    - name: Build libslurm
+      if: steps.slurm-cache.outputs.cache-hit != 'true'
+      run: |
+        git clone --quiet --depth 1 --branch "$SLURM_TAG" https://github.com/SchedMD/slurm.git "$RUNNER_TEMP/slurm-src"
+        mkdir "$RUNNER_TEMP/slurm-build"
+        cd "$RUNNER_TEMP/slurm-build"
+        "$RUNNER_TEMP/slurm-src/configure" --quiet --prefix="$SLURM_PREFIX" --without-munge --disable-debug
+        make -s -j"$(nproc)" -C src/api
+        make -s -C src/api install
+        make -s install-pkgincludeHEADERS
+        test -f "$SLURM_PREFIX/include/slurm/slurm_version.h"
+
+    - name: Install Rust
+      run: |
+        rustup toolchain install stable --profile minimal --component clippy --no-self-update
+        rustup default stable
+        rustc --version
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Test
+      run: cargo test --locked
+
+    # --all-features also lints tests/cluster.rs. Must stay warning-free.
+    - name: Clippy
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
